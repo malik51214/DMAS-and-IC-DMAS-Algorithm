@@ -1,0 +1,466 @@
+clc;  
+clear;
+close all;
+
+%% 1. System Parameters
+c = 3e8;
+antenna_radius = 72.8e-3; % 72mm in meters
+z_height = 26.8e-3;     % 26.8mm in meters 
+tumor_radius = 5e-3;    % Tumor radius parameter
+breast_radius = 50e-3;
+folderPath = 'E:\Ali Raza\2025\23-06-25';
+numTx = 4;
+numRx = 4;
+numRot = 24;
+angleStep = 15;
+num_time = 201;
+
+% Dielectric properties
+epsilon = 9;
+
+%% 2. Data Loading & Preprocessing
+fprintf('=== Loading and Preprocessing Data ===\n');
+
+% Read one file to determine number of frequency points
+sampleFile = fullfile(folderPath, 'rotation_01.csv');
+sampleData = readmatrix(sampleFile);
+numFreq = size(sampleData, 1);
+freq = sampleData(:,2)*1e9;
+df = freq(2) - freq(1);
+
+% Initialize 4D array
+S = complex(zeros(numFreq, numTx, numRx, numRot));
+
+% Load all rotation files
+for rot = 1:numRot
+    filename = sprintf('rotation_%02d.csv', rot);
+    filepath = fullfile(folderPath, filename);
+    data = readmatrix(filepath);
+    
+    fprintf('File: %s, Columns: %d\n', filename, size(data, 2));
+    % Extract complex S-parameters
+    s_real = data(:, 3:2:end);
+    s_imag = data(:, 4:2:end);
+    s_complex = complex(s_real, s_imag);
+
+    
+    % Reshape to S(f, tx, rx)
+    for tx = 1:numTx
+        rx_idx = 0;
+        for rx = 1:numRx
+        rx_idx = rx_idx + 1;
+            idx = (tx - 1) * numRx + rx;
+            S(:, tx, rx, rot) = s_complex(:, idx);
+        end
+    end
+end
+
+% Debug: Verify Raw S-parameters
+fprintf('\n=== Debug 1: Checking Raw S-parameters ===\n');
+fprintf('Max |S|: %.3f\n', max(abs(S(:))));
+fprintf('Min |S|: %.3f\n', min(abs(S(:))));
+figure;
+plot(freq/1e9, 20*log10(abs(S(:,1,4,1))));
+xlabel('Frequency (GHz)'); ylabel('|S| (dB)');
+title('Raw S-parameters (Tx1, Rx1, Rot1)');
+grid on
+
+%% 3. Rotation Subtraction
+fprintf('\n=== Applying Rotation Subtraction ===\n');
+
+S_skin_removed = complex(zeros(numFreq, numTx, numRx, numRot/2));
+
+pairIdx = 1;
+for oddIdx = 1:2:numRot
+    evenIdx = oddIdx + 1;
+    S_skin_removed(:, :, :, pairIdx) = S(:, :, :, oddIdx) - S(:, :, :, evenIdx);
+    pairIdx = pairIdx + 1;
+end
+
+% Debug: Verify Skin Subtraction
+fprintf('\n=== Debug 2: Checking Skin Subtraction ===\n');
+fprintf('Max |S_skin_removed|: %.3f\n', max(abs(S_skin_removed(:))));
+fprintf('Min |S_skin_removed|: %.3f\n', min(abs(S_skin_removed(:))));
+figure;
+subplot(2,1,1);
+plot(freq/1e9, 20*log10(abs(S(:,1,4,1)))); 
+title('Original S-parameter');
+subplot(2,1,2);
+plot(freq/1e9, 20*log10(abs(S_skin_removed(:,1,4,1))));
+title('After Skin Removal');
+xlabel('Frequency (GHz)');
+
+%% 4. Convert to Time Domain with Hann Window Only
+fprintf('\n=== Convert to Time Domain with Hann Window ===\n');
+
+% Window function: Hann
+window_type = @hann;
+
+% Generate window only (no Gaussian pulse)
+f = freq(:);  % Column vector of frequencies
+win = window_type(length(f));  % Hann window of same length
+
+% Apply windowing and convert to time domain
+T = zeros(numFreq, numTx, numRx, numRot/2);
+for tx = 1:numTx
+    for rx = 1:numRx
+        for phi = 1:numRot/2
+            % 1. Get original spectrum
+            spectrum = squeeze(S_skin_removed(:, tx, rx, phi));
+            if size(spectrum,2) > size(spectrum,1)
+                spectrum = spectrum';  % Ensure column
+            end
+
+            % 2. Apply Hann window
+            windowed_spectrum = spectrum .* win;
+
+            % 3. Convert to time domain using symmetric IFFT
+            T(:, tx, rx, phi) = ifft(windowed_spectrum, numFreq, 'symmetric');
+        end
+    end
+end
+
+% Time vector for reference
+dt = 1/(numFreq*df);
+time_vector = (0:numFreq-1)*dt;
+
+
+%% 5. Imaging Grid & Tissue Masks
+fprintf('\n=== Setting Up Imaging Grid ===\n');
+
+grid_res = 1e-3; % 5 mm resolution
+x_range = -breast_radius:grid_res:breast_radius;
+y_range = -breast_radius:grid_res:breast_radius;
+[X, Y] = meshgrid(x_range, y_range);
+X_flat = X(:); 
+Y_flat = Y(:); 
+Z_flat = zeros(size(X_flat));
+C = [X_flat, Y_flat, Z_flat];
+
+% Create tissue masks
+tumor_mask = (X_flat.^2 + Y_flat.^2) < tumor_radius^2;
+breast_mask = (X_flat.^2 + Y_flat.^2) < breast_radius^2;
+
+grid_params = struct('X', X, 'Y', Y, 'x_range', x_range, 'y_range', y_range, ...
+                        'res', grid_res, 'antenna_radius', antenna_radius);
+
+%% 6. Delay Calculation with Tissue Properties
+fprintf('\n=== Calculating Time Delays ===\n');
+
+theta_ant = deg2rad((0:3) * 90);  % Rotate by +180 degrees
+A_base = [antenna_radius*cos(theta_ant)', antenna_radius*sin(theta_ant)', z_height*ones(4,1)];
+phi_list = (0:(numRot-1)) * angleStep * 2; % Only odd rotations after subtraction
+
+fprintf('\n=== Calculating Delay Using Equation with l (Fixed Epsilon) ===\n');
+
+Nv = size(C, 1);
+tau = zeros(Nv, numTx, numRx, length(phi_list));
+
+
+sqrt_eps_b = 1.93; % Use background permittivity (fat) as ε_b
+
+for p = 1:length(phi_list)
+    phi_rad = deg2rad(phi_list(p));
+    Rz = [cos(phi_rad), -sin(phi_rad), 0;
+          sin(phi_rad),  cos(phi_rad), 0;
+          0,              0,           1];
+    
+    A_rot = (Rz * A_base')';  % Rotated antenna coordinates [12 x 3]
+
+    for tx = 1:numTx
+        Tx_pos = A_rot(tx, :);  % [1x3]
+        for rx = 1:numRx
+            Rx_pos = A_rot(rx, :);  % [1x3]
+            
+            % Distance from Tx to voxel
+            d1 = sqrt(sum((Tx_pos - C).^2, 2));  % [Nv x 1]
+            
+            % Distance from voxel to Rx
+            d2 = sqrt(sum((C - Rx_pos).^2, 2));  % [Nv x 1]
+            
+            % Total path length
+            d_total = (d1 + d2);  % [Nv x 1]
+
+            % Apply fixed sqrt(ε_b) as per your equation
+            tau(:, tx, rx, p) = (sqrt_eps_b * d_total) / c;  % [Nv x 1]
+        end
+    end
+end
+
+
+%% Debug 4: Verify Time Delays
+fprintf('\n=== Debug 4: Checking Time Delays ===\n');
+fprintf('Max tau: %.2f ns\n', max(tau(:))*1e9);
+fprintf('Min tau: %.2f ns\n', min(tau(:))*1e9);
+figure;
+histogram(tau(:)*1e9, 50);
+xlabel('Time Delay (ns)'); ylabel('Count');
+title('Distribution of Time Delays');
+
+
+%% 7. DMAS Beamforming
+fprintf('\n=== Performing DMAS Beamforming ===\n');
+num_voxels = length(C);
+
+reconstructed_img = zeros(num_voxels, 1);
+
+for i = 1:num_voxels
+    acc = 0;
+        for phi = 1:(numRot/2)
+            for tx = 1:numTx
+                for rx = 1:numRx
+                    for phi_p = phi:(numRot/2)
+                        for tx_p = tx:numTx
+                            for rx_p = (rx+1):numRx
+                                t1 = round(tau(i,tx,rx,phi)/dt);
+                                t2 = round(tau(i,tx_p,rx_p,phi_p)/dt);
+                                if t1 < num_time && t2 < num_time && t1 > 0 && t2 > 0
+                                   acc = acc + T(t1,tx,rx,phi) * T(t2,tx_p,rx_p,phi_p);
+                                end          
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    reconstructed_img(i) = acc;
+end
+
+
+%% Reshape and Normalize
+img_DMAS = reshape(real(reconstructed_img), size(X));
+img_DMAS = img_DMAS / max(img_DMAS(:));
+
+%% Display Result
+fprintf('\n=== Displaying Reconstructed Image ===\n');
+figure;
+imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS);
+axis image; colorbar;
+title('DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+R = breast_radius;
+mask = (X.^2 + Y.^2) <= R^2;
+
+% Apply Gaussian filtering to DMAS output
+filter_size = max(3, round(2 * tumor_radius / grid_params.res)); % Ensure minimum size
+sigma = tumor_radius / grid_params.res * 5;                     % Smoothing factor
+H = fspecial('gaussian', filter_size, sigma);                    % Gaussian filter kernel
+img_DMAS_filtered = imfilter(img_DMAS, H, 'replicate');          % Apply filter
+
+% Optional: Apply breast mask to zero out outside regions
+breast_mask_2D = reshape(breast_mask, size(img_DMAS));
+img_DMAS_filtered = img_DMAS_filtered .* breast_mask_2D;         % Mask outside breast
+figure;
+h1 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS_filtered);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h1, 'AlphaData', mask);
+title('Filtered DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+
+
+% Apply abs and sqrt before reshaping
+img_DMAS2 = (abs(reconstructed_img)).^2;      % <-- New processing
+img_DMAS2 = reshape(img_DMAS2, size(X));
+img_DMAS2 = img_DMAS2 / max(img_DMAS2(:));       % Normalize to [0, 1]
+
+fprintf('\n=== Displaying Reconstructed Image ===\n');
+figure;
+imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS2);
+axis image; colorbar;
+title('DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+
+R = breast_radius;
+mask = (X.^2 + Y.^2) <= R^2;
+
+% Apply Gaussian filtering to DMAS output
+filter_size = max(3, round(2 * tumor_radius / grid_params.res)); % Ensure minimum size
+sigma = tumor_radius / grid_params.res * 5;                     % Smoothing factor
+H = fspecial('gaussian', filter_size, sigma);                    % Gaussian filter kernel
+img_DMAS_filtered2 = imfilter(img_DMAS2, H, 'replicate');          % Apply filter
+
+% Optional: Apply breast mask to zero out outside regions
+breast_mask_2D = reshape(breast_mask, size(img_DMAS2));
+img_DMAS_filtered2 = img_DMAS_filtered2 .* breast_mask_2D;         % Mask outside breast
+figure;
+h1 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS_filtered2);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h1, 'AlphaData', mask);
+title('Filtered DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+%% 8. IC-DMAS Algorithm Implementation
+fprintf('\n=== Implementing IC-DMAS Algorithm ===\n');
+
+% Parameters for IC-DMAS
+max_iterations = 7;       % Maximum number of iterations
+convergence_threshold = 1e-3; % Convergence threshold for E_Υ
+smoothing_factor = 5;     % For the inverse weighting integral averaging
+
+% Initialize variables
+Upsilon_prev = img_DMAS(:); % Initial DMAS result
+tau_original = tau;       % Save original time delays
+tau_current = tau;        % Current time delays (will be updated)
+E_Upsilon_history = zeros(max_iterations, 1); % To track convergence
+
+% Create distance matrix between voxels (P_C-C in equation 1.9)
+fprintf('Creating voxel distance matrix...\n');
+Nv = size(C, 1);
+P_CC = zeros(Nv, Nv);
+for i = 1:Nv
+    P_CC(i,:) = sqrt(sum((C - C(i,:)).^2, 2))';
+end
+
+% Main IC-DMAS loop
+for iter = 1:max_iterations
+    fprintf('\n=== IC-DMAS Iteration %d ===\n', iter);
+    
+    % Step 1: Calculate smoothed Upsilon' (equation 1.9)
+    fprintf('Calculating smoothed Upsilon...\n');
+    Upsilon_smoothed = zeros(Nv, 1);
+    for i = 1:Nv
+        weights = 1 ./ (1 + P_CC(i,:)');
+        Upsilon_smoothed(i) = sum(Upsilon_prev .* weights) / sum(weights);
+    end
+    
+    % Step 2: Update time delays (equation 1.10)
+    fprintf('Updating time delays...\n');
+    tau_current = tau_original + Upsilon_smoothed / c;
+    
+    % Step 3: Reconstruct image with new delays (equation 1.11)
+    fprintf('Performing DMAS with updated delays...\n');
+    Upsilon_current = zeros(Nv, 1);
+    
+    for i = 1:Nv
+        acc = 0;
+        for phi = 1:(numRot/2)
+            for tx = 1:numTx
+                for rx = 1:numRx
+                    for phi_p = phi:(numRot/2)
+                        for tx_p = tx:numTx
+                            for rx_p = (rx+1):numRx
+                                % Get updated time indices
+                                t1 = round(tau_current(i,tx,rx,phi)/dt);
+                                t2 = round(tau_current(i,tx_p,rx_p,phi_p)/dt);
+                                
+                                % Ensure indices are within bounds
+                                if t1 > 0 && t1 <= num_time && t2 > 0 && t2 <= num_time
+                                    acc = acc + T(t1,tx,rx,phi) * T(t2,tx_p,rx_p,phi_p);
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        Upsilon_current(i) = acc;
+    end
+    
+    % Normalize the current reconstruction
+    Upsilon_current = Upsilon_current / max(abs(Upsilon_current(:)));
+    
+    % Step 4: Calculate convergence metric (equation 1.11)
+    E_Upsilon = sum(abs(Upsilon_current - Upsilon_prev));
+    E_Upsilon_history(iter) = E_Upsilon;
+    fprintf('Iteration %d: E_Υ = %.6f\n', iter, E_Upsilon);
+    
+    % Check for convergence
+    if E_Upsilon < convergence_threshold
+        fprintf('Convergence reached at iteration %d\n', iter);
+        break;
+    end
+    
+    % Update for next iteration
+    Upsilon_prev = Upsilon_current;
+end
+
+
+% Reshape final IC-DMAS image
+img_ICDMAS = reshape(real(Upsilon_current), size(X));
+img_ICDMAS = img_ICDMAS / max(img_ICDMAS(:));
+
+%% Display IC-DMAS Results
+fprintf('\n=== Displaying IC-DMAS Results ===\n');
+
+% Plot convergence history
+figure;
+plot(1:iter, E_Upsilon_history(1:iter), 'o-');
+xlabel('Iteration'); ylabel('E_Υ');
+title('Convergence History');
+grid on;
+
+% Display final IC-DMAS image
+figure;
+imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_ICDMAS);
+axis image; colorbar;
+title('IC-DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+% Apply same filtering as DMAS for comparison
+img_ICDMAS_filtered = imfilter(img_ICDMAS, H, 'replicate');
+img_ICDMAS_filtered = img_ICDMAS_filtered .* breast_mask_2D;
+
+figure;
+h2 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_ICDMAS_filtered);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h2, 'AlphaData', mask);
+title('Filtered IC-DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+
+
+
+% Apply abs and sqrt before reshaping
+img_ICDMAS2 = (abs(reconstructed_img)).^2;      % <-- New processing
+img_ICDMAS2 = reshape(img_DMAS2, size(X));
+img_DMAS2 = img_DMAS2 / max(img_DMAS2(:));       % Normalize to [0, 1]
+
+fprintf('\n=== Displaying Reconstructed Image ===\n');
+figure;
+imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS2);
+axis image; colorbar;
+title('DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+
+R = breast_radius;
+mask = (X.^2 + Y.^2) <= R^2;
+
+% Apply Gaussian filtering to DMAS output
+filter_size = max(3, round(2 * tumor_radius / grid_params.res)); % Ensure minimum size
+sigma = tumor_radius / grid_params.res * 5;                     % Smoothing factor
+H = fspecial('gaussian', filter_size, sigma);                    % Gaussian filter kernel
+img_DMAS_filtered2 = imfilter(img_DMAS2, H, 'replicate');          % Apply filter
+
+% Optional: Apply breast mask to zero out outside regions
+breast_mask_2D = reshape(breast_mask, size(img_DMAS2));
+img_DMAS_filtered2 = img_DMAS_filtered2 .* breast_mask_2D;         % Mask outside breast
+figure;
+h1 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS_filtered2);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h1, 'AlphaData', mask);
+title('Filtered DMAS Reconstructed Image');
+xlabel('X (mm)'); ylabel('Y (mm)');
+%% Side-by-Side Comparison
+figure;
+subplot(1,2,1);
+h1 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_DMAS_filtered);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h1, 'AlphaData', mask);
+title('DMAS');
+xlabel('X (mm)'); ylabel('Y (mm)');
+
+subplot(1,2,2);
+h2 = imagesc(grid_params.x_range*1e3, grid_params.y_range*1e3, img_ICDMAS_filtered);
+axis image; colorbar;
+set(gca, 'YDir', 'normal');
+set(h2, 'AlphaData', mask);
+title('IC-DMAS');
+xlabel('X (mm)'); ylabel('Y (mm)');
